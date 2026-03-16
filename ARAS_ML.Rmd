@@ -1,0 +1,299 @@
+---
+title: "Airway Microbiome Analysis"
+author: "Dan Kerchner"
+date: "2023-05-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)
+```
+# Load and merge data
+```{r}
+# MICROBIOME DATA
+md <- read.csv('data/metadata_nose_v2.csv', blank.lines.skip = TRUE)
+md <- md %>%
+  select(-c(SRAcode, patient, season))
+
+# CLINICAL DATA
+rd <- read.csv('data/Registo_working.csv')
+rd <- rd %>%
+  mutate(Gender = case_when(Gender == "Feminino" ~ "F",
+                            Gender == "Masculino" ~ "M")) %>%
+  mutate(season = case_when(season == "spring" ~ "spring",
+                             TRUE ~ "not spring"))
+
+# JOIN
+df <- left_join(md, rd, by=c('ID', 'asthma_rhinitis')) 
+
+df <- df %>%
+  select(-ID) %>%
+  mutate(asthma_rhinitis = factor(asthma_rhinitis, levels = c("AR", "ARAS")),
+         TCUT_Positive_IgE_for_Aeroallergens = factor(TCUT_Positive_IgE_for_Aeroallergens),
+         Bronchodilation_Positive = factor(Bronchodilation_Positive))
+
+# Omit incomplete observations
+df_all <- na.omit(df)
+
+# Renumber
+rownames(df_all) <- 1:nrow(df_all)
+
+# Microbiome data, but only for the patients who also had complete clinical data
+microbiome_df <- df_all %>%
+  select(asthma_rhinitis, Firmicutes:Prevotella)
+```
+
+# Logistic regression
+
+```{r}
+set.seed(1234)
+
+model1 <- glm(asthma_rhinitis ~ .,
+              family = binomial(link = "logit"),
+              data = df_all)
+
+# 10-fold CV for logistic regression
+model1_logit_cv <- train(x = df_all[2:length(names(df_all))],
+                         y = df_all$asthma_rhinitis,
+                         method = "glm", family = binomial(link = "logit"),
+                         trControl = trainControl(method = "cv", number = 10,
+                                                  summaryFunction = twoClassSummary,
+                                                  classProbs = TRUE, savePredictions = TRUE))
+model1_logit_cv$results
+```
+
+```{r}
+fm1 <- model1_logit_cv$finalModel
+summary(fm1)
+```
+
+```{r message=FALSE, warning=FALSE}
+fm1_coefs <- coef(fm1)[-1]
+fm1_names <- rownames(fm1$R)[-1]
+fm1_confint <- confint(fm1)[-1, ]
+fm1_results <- data.frame(fm1_names, fm1_coefs,
+                          fm1_ll = fm1_confint[,1],
+                          fm1_ul = fm1_confint[,2]) %>%
+  arrange(desc(fm1_coefs))
+
+ggplot(fm1_results) +
+  geom_point(aes(y = fm1_names, x = fm1_coefs)) + 
+  geom_errorbar(aes(y = fm1_names, x = fm1_coefs,
+                    xmin=fm1_ll, xmax=fm1_ul))
+```
+
+```{r}
+prob_thresh <- seq(0.05, 0.95, by = 0.05)
+model1_logit_ths <- thresholder(model1_logit_cv, threshold = prob_thresh,
+                                statistics = c("Sensitivity", "Specificity", "Accuracy", "Kappa"))
+model1_logit_ths
+```
+
+We select the classification threshold by maximizing Cohen's $\kappa$.
+
+```{r}
+model1_threshold <- model1_logit_ths[which.max(model1_logit_ths$Kappa), ]
+model1_threshold
+```
+
+Where Kappa is maximized, at a threshold of 0.70, the test accuracy is 0.6802.
+
+# Stepwise Selection
+
+```{r}
+model2_stepwise <- step(model1, direction = "both",
+                        k = log(nrow(df_all)), # This k gives BIC
+                        trace = FALSE) 
+model2_stepwise$formula
+```
+```{r}
+# Which variables are still in?
+model2_xnames <- names(model2_stepwise$coefficients)[-1]
+model2_xnames
+```
+
+## Manually estimate test accuracy using 10-fold cross-validation 
+```{r}
+library(psych)
+set.seed(12345)
+mean_accuracy <- 0.0
+n_cv <- 10
+for(i in 1:n_cv){
+  df_sample_train_idx <- sample(1:nrow(df_all), size = 0.75*nrow(df_all))
+  df_sample_train <- df_all[df_sample_train_idx,]
+  df_sample_test <- df_all[-df_sample_train_idx,]
+  model2_i <- glm(asthma_rhinitis ~ .,
+                  family = binomial(link = "logit"),
+                  data = df_sample_train)
+  model2_stepwise_cv_i <- step(model1,
+                               direction = "both",
+                               k = log(nrow(df_all)),
+                               trace = 0)
+  prob_thresh <- seq(0.1, 0.9, by = 0.1)
+
+  # We select the classification threshold by maximizing Cohen's $\kappa$.
+  max_k <- 0
+  best_pt <- NA
+  accuracy <- 0
+  for(pt in prob_thresh) {
+    model2_test_pred_class <- factor(ifelse(
+      predict(model2_stepwise_cv_i, newdata = df_sample_test[,-1], type = "response") >= pt,
+      "ARAS",
+      "AR"),
+      levels = c("AR", "ARAS"))
+    
+    ck_i <- cohen.kappa(cbind(df_sample_test$asthma_rhinitis, model2_test_pred_class))
+    if(ck_i$kappa >= max_k){
+      max_k <- ck_i$kappa
+      best_pt <- pt  # Not sure why this is always coming out to 0.5
+      accuracy <- sum(df_sample_test$asthma_rhinitis == model2_test_pred_class)/length(df_sample_test)
+      #print(accuracy)
+    }
+  }
+  mean_accuracy <- mean_accuracy + accuracy/n_cv
+}
+print(mean_accuracy)
+```
+
+Mean accuracy as estimated by 10-fold cross-validation is `r mean_accuracy`.
+
+
+
+
+# LASSO Regression
+
+```{r}
+########
+# Lasso
+########
+library(glmnet)
+# LASSO regression with glmnet (from glmnet package)
+# the glmnet() function fits the "complete" solution paths
+df_y <- ifelse(df_all$asthma_rhinitis == "AR", "0", "1")
+df_x <- model.matrix(asthma_rhinitis ~ ., data = df_all)[, -1]
+df_lasso <- glmnet(x = df_x,
+                   y = df_y,
+                   alpha = 1,
+                   family = 'binomial')
+lassologit_tune_grid <- data.frame(alpha = 1, lambda = df_lasso$lambda)
+# plot solutions paths (from plotmo package)
+plot(df_lasso, xvar = "lambda")
+
+# use 10-fold CV to select the tuning parameter lambda
+set.seed(1234)
+df_lasso_cv <- cv.glmnet(x = df_x,
+                         y = df_y,
+                         method = "glmnet",
+                         family = "binomial",
+                         tuneGrid = lassologit_tune_grid,  # Using this resulted in all variables dropping out
+                         alpha = 1, nfolds = 10,
+                         type.measure = 'class')
+
+# Find index of minimum lambda
+min_lambda_idx <- which(df_lasso_cv$lambda==df_lasso_cv$lambda.min)
+
+# Compute accuracy at that index, as 1 minus cross validation error
+df_lasso_cv_accuracy = 1 - df_lasso_cv$cvm[min_lambda_idx]
+```
+
+Cross-validation accuracy for LASSO is `r df_lasso_cv_accuracy`
+
+```{r}
+
+plot(df_lasso_cv$glmnet.fit, xvar = "lambda")
+```
+
+```{r}
+
+# look at solution corresponding to selected lambda based on minimum 10-fold CV MSE
+# note that this model is fit on the entire training data set
+predict(df_lasso_cv, s = df_lasso_cv$lambda.min, type = "coef")
+
+```
+
+```{r}
+##### 
+# Group lasso using gglasso
+#####
+
+# library(gglasso)
+# set.seed(1234)
+# group_num <- c(1:35, 36, 36, 36) # group 36 is for "season"
+# model_gl <- gglasso(x = df_x,
+#                     y = factor(df_all$asthma_rhinitis, levels = c("AR", "ARAS")),
+#                     group = group_num)
+
+# Results in the following, which seems to contradict the documentation that states that
+# for logistic regression, y should be a factor.
+# 
+# Error in gglasso(x = df_x, y = factor(df_all$asthma_rhinitis, levels = c("AR",  : 
+#   The response y must be numeric. Factors must be converted to numeric
+
+```
+
+# Random Forest
+
+```{r}
+library(randomForest)
+
+####
+# randomForest with full model
+####
+set.seed(1234)
+rf_train <- train(x = df_all %>% select(-asthma_rhinitis),
+                   y = df_all$asthma_rhinitis,
+                   method = "rf", ntree = 500,
+                  tuneGrid = data.frame(mtry = 1:10),
+                  trControl = trainControl(method = "cv", number = 10))
+rf_train
+
+# Confirm that 500 trees is more than enough
+plot(x = 1:500, y = rf_train$finalModel$err.rate[,1], type = "l",
+     xlab = "Number of Trees", ylab = "OOB Error Rate")
+```
+
+```{r}
+# obtain OOB error rate / accuracy for selected model
+rf_train$results$Accuracy[rf_train$bestTune$mtry]
+```
+
+```{r}
+varImpPlot(rf_train$finalModel, main = "Variable Importance Plot", n.var = 10)
+```
+
+# Random Forest with reduced model
+```{r}
+####
+# randomForest with reduced model, result of stepwise selection
+####
+set.seed(1234)
+rf_train <- train(x = df_all %>% select(Firmicutes, Proteobacteria, Actinobacteriota, Fusobacteriota,
+                                        Bacteroidota, Moraxella, Fev1.post, MMEF75_25.post,
+                                        Nitric_Oxide, season),
+                   y = df_all$asthma_rhinitis,
+                   method = "rf", ntree = 500,
+                  tuneGrid = data.frame(mtry = 1:10),
+                  trControl = trainControl(method = "cv", number = 10))
+rf_train
+# Confirm that 500 trees is more than enough
+plot(x = 1:500, y = rf_train$finalModel$err.rate[,1], type = "l",
+     xlab = "Number of Trees", ylab = "OOB Error Rate")
+```
+
+```{r}
+# obtain OOB error rate / accuracy for selected model
+rf_train$results$Accuracy[rf_train$bestTune$mtry]
+```
+```{r}
+varImpPlot(rf_train$finalModel, main = "Variable Importance Plot", n.var = 10)
+```
+
+
