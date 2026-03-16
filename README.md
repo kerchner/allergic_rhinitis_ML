@@ -10,4 +10,6 @@ predictors from stepwise selection. Interpreting the resulting models
 yielded a subset of potential key predictors that included both clinical
 measures and microbiomes.
 
+YouTube presentation is available at:  https://www.youtube.com/watch?v=ALEO66bmr1E
+
 ![Poster - Kerchner](https://github.com/user-attachments/assets/d04985ac-5e45-42d4-8078-0e4cc472ba7a)
